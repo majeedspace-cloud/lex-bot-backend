@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 class SessionData:
     session_id: str
     name: str = "New Chat"  # Add session name for Named Sessions feature
+    owner_device_id: str | None = None  # which device owns this session's data
     chat_history: list[dict] = field(default_factory=list)
     vector_store: VectorStore | None = None
     processed_files: set[tuple[str, int]] = field(default_factory=set)
@@ -48,7 +49,9 @@ class SessionData:
 
 class SessionStore(ABC):
     @abstractmethod
-    def get_or_create(self, session_id: str) -> SessionData: ...
+    def get_or_create(
+        self, session_id: str, owner_device_id: str | None = None
+    ) -> SessionData: ...
 
     @abstractmethod
     def get(self, session_id: str) -> SessionData | None:
@@ -67,8 +70,8 @@ class SessionStore(ABC):
         ...
 
     @abstractmethod
-    def list_sessions(self) -> list[dict]:
-        """Return list of all sessions with their metadata (id, name, last_active)."""
+    def list_sessions(self, device_id: str | None = None) -> list[dict]:
+        """Return sessions owned by the given device (all sessions if device_id is None)."""
         ...
 
     @abstractmethod
@@ -89,11 +92,15 @@ class InMemorySessionStore(SessionStore):
         self._sessions: dict[str, SessionData] = {}
         self._lock = Lock()
 
-    def get_or_create(self, session_id: str) -> SessionData:
+    def get_or_create(
+        self, session_id: str, owner_device_id: str | None = None
+    ) -> SessionData:
         with self._lock:
             if session_id not in self._sessions:
                 logger.info("Creating new session: %s", session_id)
-                self._sessions[session_id] = SessionData(session_id=session_id)
+                self._sessions[session_id] = SessionData(
+                    session_id=session_id, owner_device_id=owner_device_id
+                )
             self._sessions[session_id].touch()
             return self._sessions[session_id]
 
@@ -120,8 +127,12 @@ class InMemorySessionStore(SessionStore):
             logger.info("Cleaned up %d expired sessions", len(expired))
         return len(expired)
 
-    def list_sessions(self) -> list[dict]:
-        """Return list of all sessions with their metadata."""
+    def list_sessions(self, device_id: str | None = None) -> list[dict]:
+        """Return sessions owned by this device. With device_id=None this
+        is the unfiltered view (server-side diagnostics / tests only) —
+        every API route passes a device_id so browsers never see each
+        other's conversations.
+        """
         with self._lock:
             return [
                 {
@@ -131,6 +142,7 @@ class InMemorySessionStore(SessionStore):
                     "message_count": len(session.chat_history),
                 }
                 for session_id, session in self._sessions.items()
+                if device_id is None or session.owner_device_id == device_id
             ]
 
     def rename_session(self, session_id: str, new_name: str) -> None:
