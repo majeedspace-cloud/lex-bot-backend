@@ -65,9 +65,6 @@ class SessionListResponse(BaseModel):
 
 class CreateSessionRequest(BaseModel):
     name: str = Field(default="New Chat", description="Name for the new session")
-    device_id: str | None = Field(
-        default=None, description="Long-lived device ID that will own this session"
-    )
 
 
 class CreateSessionResponse(BaseModel):

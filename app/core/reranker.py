@@ -147,4 +147,3 @@ class Reranker:
 
 def get_reranker(llm_client: GeminiClient, model_name: str = "gemini-3.1-flash-lite") -> Reranker:
     return Reranker(llm_client, model_name)
-
