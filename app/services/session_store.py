@@ -2,7 +2,7 @@
 
 `SessionStore` is the interface. `InMemorySessionStore` is today's
 implementation. If you outgrow it later, write a `RedisSessionStore`
-that implements the same 4 methods and swap it in `get_session_store()`
+that implements the same methods and swap it in `get_session_store()`
 below — nothing else in the app needs to change.
 """
 import logging
@@ -21,11 +21,17 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SessionData:
     session_id: str
-    name: str = "New Chat"  # Add session name for Named Sessions feature
+    name: str = "New Chat"
     chat_history: list[dict] = field(default_factory=list)
     vector_store: VectorStore | None = None
     processed_files: set[tuple[str, int]] = field(default_factory=set)
     last_active: float = field(default_factory=time.time)
+    # Which browser/device created this session. This is the actual privacy
+    # boundary — without it, list_sessions() and get-by-id have no concept
+    # of "yours" vs "everyone's" and will happily hand any caller every
+    # session on the server. None means "not yet claimed" (a session ID
+    # generated client-side that hasn't touched the backend yet).
+    owner_device_id: str | None = None
 
     def touch(self) -> None:
         self.last_active = time.time()
@@ -48,7 +54,7 @@ class SessionData:
 
 class SessionStore(ABC):
     @abstractmethod
-    def get_or_create(self, session_id: str) -> SessionData: ...
+    def get_or_create(self, session_id: str, owner_device_id: str | None = None) -> SessionData: ...
 
     @abstractmethod
     def get(self, session_id: str) -> SessionData | None:
@@ -67,8 +73,8 @@ class SessionStore(ABC):
         ...
 
     @abstractmethod
-    def list_sessions(self) -> list[dict]:
-        """Return list of all sessions with their metadata (id, name, last_active)."""
+    def list_sessions(self, owner_device_id: str) -> list[dict]:
+        """Return sessions belonging to this device only — never all sessions."""
         ...
 
     @abstractmethod
@@ -89,11 +95,16 @@ class InMemorySessionStore(SessionStore):
         self._sessions: dict[str, SessionData] = {}
         self._lock = Lock()
 
-    def get_or_create(self, session_id: str) -> SessionData:
+    def get_or_create(self, session_id: str, owner_device_id: str | None = None) -> SessionData:
         with self._lock:
             if session_id not in self._sessions:
-                logger.info("Creating new session: %s", session_id)
-                self._sessions[session_id] = SessionData(session_id=session_id)
+                logger.info("Creating new session: %s (owner: %s)", session_id, owner_device_id)
+                self._sessions[session_id] = SessionData(session_id=session_id, owner_device_id=owner_device_id)
+            elif self._sessions[session_id].owner_device_id is None and owner_device_id is not None:
+                # Claim-on-first-touch: a session created before this fix
+                # (or via a path that didn't have a device_id yet) gets
+                # claimed by whoever legitimately touches it next with one.
+                self._sessions[session_id].owner_device_id = owner_device_id
             self._sessions[session_id].touch()
             return self._sessions[session_id]
 
@@ -120,8 +131,11 @@ class InMemorySessionStore(SessionStore):
             logger.info("Cleaned up %d expired sessions", len(expired))
         return len(expired)
 
-    def list_sessions(self) -> list[dict]:
-        """Return list of all sessions with their metadata."""
+    def list_sessions(self, owner_device_id: str) -> list[dict]:
+        """Return only sessions owned by this device — the actual privacy fix.
+        Sessions with no owner (pre-fix legacy data) are excluded from
+        everyone's list rather than shown to whoever asks first.
+        """
         with self._lock:
             return [
                 {
@@ -131,10 +145,10 @@ class InMemorySessionStore(SessionStore):
                     "message_count": len(session.chat_history),
                 }
                 for session_id, session in self._sessions.items()
+                if session.owner_device_id == owner_device_id
             ]
 
     def rename_session(self, session_id: str, new_name: str) -> None:
-        """Rename a session."""
         with self._lock:
             if session_id in self._sessions:
                 self._sessions[session_id].name = new_name

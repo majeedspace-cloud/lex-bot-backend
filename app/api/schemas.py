@@ -8,8 +8,8 @@ _settings = get_settings()
 
 class ChatRequest(BaseModel):
     session_id: str = Field(..., description="Client-generated session/conversation ID")
-    device_id: str | None = Field(
-        default=None, description="Long-lived device ID for cross-session memory (optional)"
+    device_id: str = Field(
+        ..., description="Long-lived device ID — also the ownership boundary for sessions, not just memory"
     )
     query: str = Field(
         ...,
@@ -65,6 +65,7 @@ class SessionListResponse(BaseModel):
 
 class CreateSessionRequest(BaseModel):
     name: str = Field(default="New Chat", description="Name for the new session")
+    device_id: str = Field(..., description="Owner of this session — required so it's private to this device")
 
 
 class CreateSessionResponse(BaseModel):
@@ -74,6 +75,7 @@ class CreateSessionResponse(BaseModel):
 
 class RenameSessionRequest(BaseModel):
     new_name: str = Field(..., description="New name for the session")
+    device_id: str = Field(..., description="Must match the session's owner")
 
 
 class RenameSessionResponse(BaseModel):

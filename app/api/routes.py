@@ -36,11 +36,22 @@ from app.api.schemas import (
 from app.core.config import get_settings
 from app.core.rate_limit import limiter
 from app.services.rag_service import RAGService
-from app.services.session_store import SessionStore
+from app.services.session_store import SessionData, SessionStore
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 settings = get_settings()
+
+
+def _verify_ownership(session: SessionData, device_id: str) -> None:
+    """The actual privacy boundary. Raises 404 (not 403) on a mismatch —
+    doesn't confirm to a caller that a session with this ID even exists,
+    it just looks like it's not there. Sessions with no owner yet
+    (owner_device_id is None) pass through here — get_or_create() already
+    claimed them for the current caller before this check runs.
+    """
+    if session.owner_device_id is not None and session.owner_device_id != device_id:
+        raise HTTPException(status_code=404, detail="Session not found")
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -51,7 +62,8 @@ async def chat(
     rag: RAGService = Depends(get_rag_service),
     store: SessionStore = Depends(get_store),
 ):
-    session = store.get_or_create(body.session_id)
+    session = store.get_or_create(body.session_id, owner_device_id=body.device_id)
+    _verify_ownership(session, body.device_id)
     session.maybe_auto_name(body.query)
     result = await run_in_threadpool(rag.chat, session, body.query, body.device_id)
     store.save(session)
@@ -67,6 +79,7 @@ async def chat(
 async def upload_pdf(
     request: Request,
     session_id: str = Form(...),
+    device_id: str = Form(...),
     file: UploadFile = File(...),
     rag: RAGService = Depends(get_rag_service),
     store: SessionStore = Depends(get_store),
@@ -83,7 +96,8 @@ async def upload_pdf(
             detail=f"File too large — max {settings.max_upload_mb}MB, got {len(contents) / 1024 / 1024:.1f}MB.",
         )
 
-    session = store.get_or_create(session_id)
+    session = store.get_or_create(session_id, owner_device_id=device_id)
+    _verify_ownership(session, device_id)
 
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(contents)
@@ -132,7 +146,8 @@ async def chat_stream(
     same protection run_in_threadpool gives the non-streaming endpoints,
     just handled for us automatically here.
     """
-    session = store.get_or_create(body.session_id)
+    session = store.get_or_create(body.session_id, owner_device_id=body.device_id)
+    _verify_ownership(session, body.device_id)
     session.maybe_auto_name(body.query)
 
     def event_stream():
@@ -155,14 +170,18 @@ async def chat_stream(
 @router.get("/documents", response_model=DocumentListResponse)
 async def list_documents(
     session_id: str,
+    device_id: str,
     rag: RAGService = Depends(get_rag_service),
     store: SessionStore = Depends(get_store),
 ):
     """Powers the sidebar's document list — filenames + chunk counts for this session."""
     try:
-        session = store.get_or_create(session_id)
+        session = store.get_or_create(session_id, owner_device_id=device_id)
+        _verify_ownership(session, device_id)
         docs = await run_in_threadpool(rag.list_documents, session)
         return DocumentListResponse(documents=[DocumentInfo(**d) for d in docs])
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.warning("Could not list documents for session %s: %s", session_id, exc)
         return DocumentListResponse(documents=[])
@@ -172,11 +191,13 @@ async def list_documents(
 async def delete_document(
     filename: str,
     session_id: str,
+    device_id: str,
     rag: RAGService = Depends(get_rag_service),
     store: SessionStore = Depends(get_store),
 ):
     """Powers the sidebar's delete button — removes a doc's chunks from this session's index."""
-    session = store.get_or_create(session_id)
+    session = store.get_or_create(session_id, owner_device_id=device_id)
+    _verify_ownership(session, device_id)
     deleted = await run_in_threadpool(rag.delete_document, session, filename)
     if not deleted:
         raise HTTPException(status_code=404, detail=f"'{filename}' not found in this session.")
@@ -187,27 +208,20 @@ async def delete_document(
 
 @router.get("/sessions", response_model=SessionListResponse)
 async def list_sessions(
+    device_id: str,
     store: SessionStore = Depends(get_store),
-    rag: RAGService = Depends(get_rag_service),
 ):
-    """Return list of non-empty sessions for the sidebar."""
-    all_sessions = await run_in_threadpool(store.list_sessions)
-    
-    # Filter out blank sessions (no chat messages AND no uploaded PDFs)
-    active_sessions = []
-    for sess in all_sessions:
-        session_obj = store.get(sess["session_id"])
-        if session_obj:
-            has_messages = len(session_obj.chat_history) > 0
-            has_docs = len(rag.list_documents(session_obj)) > 0
-            if has_messages or has_docs:
-                active_sessions.append(sess)
-                
+    """Return this device's own sessions only — never anyone else's.
+    This is the endpoint that was leaking everyone's sessions to everyone;
+    device_id is now required and used as the actual filter.
+    """
+    active_sessions = await run_in_threadpool(store.list_sessions, device_id)
     return SessionListResponse(sessions=active_sessions)
 
 @router.get("/sessions/{session_id}", response_model=SessionDetailResponse)
 async def get_session_detail(
     session_id: str,
+    device_id: str,
     rag: RAGService = Depends(get_rag_service),
     store: SessionStore = Depends(get_store),
 ):
@@ -218,8 +232,11 @@ async def get_session_detail(
     doesn't exist on the backend yet — that's correct, not an error. This
     materializes it as an empty session instead of 404ing, matching the
     "don't persist until it's actually used" design the frontend expects.
+    Ownership is still enforced below — a fresh ID gets claimed by whoever
+    touches it first, but an already-claimed one stays locked to its owner.
     """
-    session = await run_in_threadpool(store.get_or_create, session_id)
+    session = await run_in_threadpool(store.get_or_create, session_id, device_id)
+    _verify_ownership(session, device_id)
 
     docs = await run_in_threadpool(rag.list_documents, session)
     return SessionDetailResponse(
@@ -235,13 +252,13 @@ async def create_session(
     body: CreateSessionRequest,
     store: SessionStore = Depends(get_store),
 ):
-    """Create a new session with an optional name."""
+    """Create a new session with an optional name, owned by the requesting device."""
     import uuid
     session_id = str(uuid.uuid4())
-    session = store.get_or_create(session_id)
+    session = store.get_or_create(session_id, owner_device_id=body.device_id)
     session.name = body.name
     store.save(session)
-    logger.info("Created new session: %s with name '%s'", session_id, body.name)
+    logger.info("Created new session: %s with name '%s' for device %s", session_id, body.name, body.device_id)
     return CreateSessionResponse(session_id=session_id, name=body.name)
 
 
@@ -251,22 +268,26 @@ async def rename_session(
     body: RenameSessionRequest,
     store: SessionStore = Depends(get_store),
 ):
-    """Rename an existing session."""
+    """Rename an existing session — only its owner can."""
     session = await run_in_threadpool(store.get, session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    
+    _verify_ownership(session, body.device_id)
+
     await run_in_threadpool(store.rename_session, session_id, body.new_name)
-    session = store.get_or_create(session_id)
     return RenameSessionResponse(session_id=session_id, name=body.new_name)
 
 
 @router.delete("/sessions/{session_id}", response_model=DeleteSessionResponse)
 async def delete_session(
     session_id: str,
+    device_id: str,
     store: SessionStore = Depends(get_store),
 ):
-    """Delete a session and all its data."""
+    """Delete a session and all its data — only its owner can."""
+    session = await run_in_threadpool(store.get, session_id)
+    if session:
+        _verify_ownership(session, device_id)
     await run_in_threadpool(store.delete, session_id)
     logger.info("Deleted session: %s", session_id)
     return DeleteSessionResponse(session_id=session_id, deleted=True)
