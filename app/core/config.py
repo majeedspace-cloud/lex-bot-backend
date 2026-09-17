@@ -50,6 +50,12 @@ class Settings(BaseSettings):
     # --- Security ---
     # Comma-separated in .env, e.g. "http://localhost:5173,https://yourapp.com"
     allowed_origins: str = "http://localhost:5173"
+    # Optional regex for origins that change per-deploy (e.g. Vercel preview
+    # URLs get a random hash every push). Anchored with ^...$ so a domain
+    # like "yourapp-preview-abc.vercel.app.evil.com" can't sneak past a
+    # regex that only checked for the substring. None = disabled (only the
+    # exact list above is allowed).
+    allowed_origin_regex: str | None = None
     # Shared secret gate for now (MVP-appropriate). Swap for real per-user auth
     # later without touching callers — they all go through verify_api_key().
     api_key: str = ""
